@@ -23,7 +23,7 @@ from transformers import (
 from torch.optim import AdamW
 
 from model.dummy_vision_encoder import DummyVisionEncoder
-from datamodule.dummy_datamodule import DummyI2TDataset
+from datamodule.dummy_datamodule import DummyDataModule
 
 # =========================
 # Vision pooling & LLaVA module

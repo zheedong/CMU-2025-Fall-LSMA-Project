@@ -52,7 +52,7 @@ class DummyI2TDataset(Dataset):
 # Lightning DataModule
 # =========================
 
-class LLaVADataModule(LightningDataModule):
+class DummyDataModule(LightningDataModule):
     """
     LightningDataModule for I2T training.
 
