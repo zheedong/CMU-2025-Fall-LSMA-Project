@@ -12,7 +12,6 @@ from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
 
 from lightning import LightningModule, Trainer
 from transformers import (
@@ -69,21 +68,15 @@ class LLaVATrainModule(LightningModule):
     or a dict with "last_hidden_state" / "pooler_output" etc.
     """
 
-    def __init__(self, config: Dict[str, Any], vision_model: nn.Module):
+    def __init__(self, config: Dict[str, Any], vision_model: nn.Module, text_tokenizer: AutoTokenizer, text_model: AutoModelForCausalLM):
         super().__init__()
         self.save_hyperparameters(ignore=["vision_model"])
         self.config = config
 
-        # 1) Language model & tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(config["lm_model_name"])
-        if self.tokenizer.pad_token is None:
-            # Many causal LMs have no pad_token, so we reuse eos_token
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.text_tokenizer = text_tokenizer
+        self.text_model = text_model
 
-        self.lm_model = AutoModelForCausalLM.from_pretrained(
-            config["lm_model_name"]
-        )
-        lm_hidden_size = self.lm_model.config.hidden_size
+        lm_hidden_size = self.text_model.config.hidden_size
 
         # 2) Vision backbone + learnable pooling + projection
         self.vision_model = vision_model
@@ -298,7 +291,7 @@ if __name__ == "__main__":
     }
 
     # 1) Build DataModule (will internally create tokenizer and datasets)
-    datamodule = LLaVADataModule(
+    datamodule = DummyDataModule(
         tokenizer_name=config["lm_model_name"],
         train_length=1000,
         val_length=200,
@@ -313,12 +306,27 @@ if __name__ == "__main__":
         vision_hidden_size=config["vision_hidden_size"]
     )
 
+    # Build Text Tokenizer
+    text_tokenizer = AutoTokenizer.from_pretrained(config["lm_model_name"])
+    if text_tokenizer.pad_token is None:
+        # Many causal LMs have no pad_token, so we reuse eos_token
+        text_tokenizer.pad_token = text_tokenizer.eos_token
+
+    # Build Text Model
+    text_model = AutoModelForCausalLM.from_pretrained(config["lm_model_name"])
+
     # 3) Build LLaVA-style module
-    model = LLaVATrainModule(config=config, vision_model=vision_encoder)
+    model = LLaVATrainModule(
+        config=config,
+        vision_model=vision_encoder,
+        text_tokenizer=text_tokenizer,
+        text_model=text_model,
+    )
 
     # 4) Lightning trainer
     trainer = Trainer(
         max_epochs=3,
+        devices=1,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         precision="bf16-mixed" if torch.cuda.is_available() else "32-true",
         log_every_n_steps=10,

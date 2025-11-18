@@ -1,3 +1,6 @@
+import torch
+import torch.nn as nn
+
 # =========================
 # Dummy vision encoder & dataset for testing
 # =========================
