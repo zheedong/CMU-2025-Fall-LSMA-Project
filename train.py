@@ -22,7 +22,10 @@ from transformers import (
 from torch.optim import AdamW
 from peft import LoraConfig, get_peft_model
 
-from model.dummy_vision_encoder import DummyVisionEncoder
+from einops import rearrange
+
+# from model.dummy_vision_encoder import DummyVisionEncoder
+from model.vision_encoders import VisionEncoderWrapper
 from datamodule.dummy_datamodule import LLaVADataModule
 
 
@@ -127,7 +130,14 @@ class LLaVATrainModule(LightningModule):
         """
         # Run vision backbone with or without gradient based on freeze_vision
         with torch.set_grad_enabled(not self.config.get("freeze_vision", False)):
+            if self.config.get("freeze_vision", False):
+                self.vision_model.eval()
             vision_out = self.vision_model(pixel_values)
+        
+        # Use selected layer if provided
+        vision_out = vision_out[self.config.get("vision_layer", -1)]
+        if vision_out.dim() == 4:
+            vision_out = rearrange(vision_out, 'b 1 patch dim -> b patch dim')      # Remove seq dim
 
         # Extract sequence features [B, T, V_DIM] from various output formats
         if isinstance(vision_out, dict):
@@ -312,8 +322,11 @@ if __name__ == "__main__":
     }
 
     # 1) Build vision encoder
-    vision_encoder = DummyVisionEncoder(
-        vision_hidden_size=config["vision_hidden_size"]
+    # vision_encoder = DummyVisionEncoder(
+    #     vision_hidden_size=config["vision_hidden_size"]
+    # )
+    vision_encoder = VisionEncoderWrapper(
+        vision_encoder_name="vggt",
     )
 
     # 2) Build text tokenizer
