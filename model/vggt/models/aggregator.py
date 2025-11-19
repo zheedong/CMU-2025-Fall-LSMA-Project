@@ -70,7 +70,7 @@ class Aggregator(nn.Module):
         init_values=0.01,
     ):
         super().__init__()
-
+        self.image_size = img_size
         self.__build_patch_embed__(patch_embed, img_size, patch_size, num_register_tokens, embed_dim=embed_dim)
 
         # Initialize rotary position embedding if frequency > 0
