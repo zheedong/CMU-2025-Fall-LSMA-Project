@@ -208,3 +208,4 @@ __marimo__/
 
 # lightning
 lightning_logs/
+data/
