@@ -84,20 +84,6 @@ class LLaVATrainModule(LightningModule):
         # Linear projection for each vision token: V_DIM -> LM_HIDDEN
         self.vision_proj = nn.Linear(vision_hidden_size, lm_hidden_size)
 
-        # Freeze only the vision backbone if requested
-        if config.get("freeze_vision", True):
-            for p in self.vision_model.parameters():
-                p.requires_grad = False
-
-        # Projection is always trainable
-        for p in self.vision_proj.parameters():
-            p.requires_grad = True
-
-        # Optionally freeze language model (only when not using LoRA)
-        if config.get("freeze_lm", True) and config.get("use_lora", False):
-            for p in self.text_model.parameters():
-                p.requires_grad = False
-
     def encode_image(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """
         Encode images into a sequence of vision token features.
@@ -310,9 +296,8 @@ if __name__ == "__main__":
         "weight_decay": 0.01,
         "warmup_steps": 100,
         "vision_hidden_size": 2048,
-        "freeze_vision": False,
-        "freeze_lm": False,   # Set True if you want to freeze LM entirely (when not using LoRA)
-        "use_lora": True,     # Set True to enable LoRA, False for plain LM
+        "freeze_vision": True,
+        "use_lora": True,
         "vision_layer": -1,   # Which layer index to use from the vision encoder outputs
         "num_workers": 8,
         "shuffle_buffer": 10000,
@@ -340,6 +325,11 @@ if __name__ == "__main__":
     vision_encoder = VisionEncoderWrapper(
         vision_encoder_name="vggt",
     )
+
+    # Freeze vision encoder
+    if config.get("freeze_vision", True):
+        for param in vision_encoder.parameters():
+            param.requires_grad = False
 
     # 2) Build text tokenizer
     text_tokenizer = AutoTokenizer.from_pretrained(
@@ -384,11 +374,16 @@ if __name__ == "__main__":
         dtype=torch.bfloat16,  # matches bf16-mixed
     )
 
+    # If use LoRA, freeze the language model
+    if config.get("use_lora", True):
+        for param in text_model.parameters():
+            param.requires_grad = False
+
     # Resize embeddings if we added new special tokens
     text_model.resize_token_embeddings(len(text_tokenizer))
 
     # 5) Optionally wrap with LoRA
-    if config.get("use_lora", False):
+    if config.get("use_lora", True):
         # Typical target modules for LLaMA-style models
         lora_target_modules = [
             "q_proj",
