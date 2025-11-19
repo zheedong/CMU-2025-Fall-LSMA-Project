@@ -9,6 +9,8 @@ Simple LLaVA-style Image-to-Text Trainer using Lightning.
 """
 
 from typing import Any, Dict, Optional
+import os
+import json
 
 import torch
 import torch.nn as nn
@@ -208,6 +210,11 @@ class LLaVATrainModule(LightningModule):
             labels=labels,
         )
         return outputs
+    
+    def on_train_start(self):
+        # Save config to log_dir
+        with open(os.path.join(self.trainer.log_dir, "config.json"), "w") as f:
+            json.dump(self.config, f)
 
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
         """
@@ -318,6 +325,8 @@ if __name__ == "__main__":
         "lora_r": 8,
         "lora_alpha": 16,
         "lora_dropout": 0.05,
+        "num_sanity_val_steps": 2,
+        "val_check_interval": 1000,
     }
     # Set number of training steps
     # Use CC3M only
@@ -420,6 +429,8 @@ if __name__ == "__main__":
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         precision="bf16-mixed" if torch.cuda.is_available() else "32-true",
         log_every_n_steps=1,
+        num_sanity_val_steps=config["num_sanity_val_steps"],
+        val_check_interval=config["val_check_interval"],
     )
 
     # 8) Train with DataModule
