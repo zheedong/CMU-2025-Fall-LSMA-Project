@@ -362,8 +362,8 @@ if __name__ == "__main__":
     
     datamodule = CCWebDatasetDataModule(
         tokenizer=text_tokenizer,
-        train_shards="data/cc3m/{00002..00331}.tar",
-        val_shards="data/cc3m/{00000..00001}.tar",
+        train_shards="data/cc3m/{00004..00331}.tar",
+        val_shards="data/cc3m/{00000..00003}.tar",
         # image_transform=image_transform,
         max_length=config["max_length"],
         batch_size=config["batch_size"],

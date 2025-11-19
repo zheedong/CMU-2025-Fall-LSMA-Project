@@ -115,11 +115,13 @@ class CCWebDatasetDataModule(LightningDataModule):
             dataset = wds.WebDataset(
                 wds.ResampledShards(shards_norm),
                 shardshuffle=is_train,
+                nodesplitter=wds.split_by_node,
             )
         else:
             dataset = wds.WebDataset(
                 shards_norm,
                 shardshuffle=is_train,
+                nodesplitter=wds.split_by_node,
             )
 
         if is_train:
