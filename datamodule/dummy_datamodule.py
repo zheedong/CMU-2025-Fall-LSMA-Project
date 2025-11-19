@@ -58,11 +58,13 @@ class LLaVADataModule(LightningDataModule):
 
     It creates DummyI2TDataset for train/val/test
     and returns corresponding dataloaders.
+
+    The tokenizer is provided from outside and reused for all splits.
     """
 
     def __init__(
         self,
-        tokenizer_name: str,
+        tokenizer: AutoTokenizer,
         train_length: int = 1000,
         val_length: int = 200,
         test_length: int = 200,
@@ -71,7 +73,7 @@ class LLaVADataModule(LightningDataModule):
         num_workers: int = 4,
     ):
         super().__init__()
-        self.tokenizer_name = tokenizer_name
+        self.tokenizer = tokenizer
         self.train_length = train_length
         self.val_length = val_length
         self.test_length = test_length
@@ -79,24 +81,22 @@ class LLaVADataModule(LightningDataModule):
         self.batch_size = batch_size
         self.num_workers = num_workers
 
-        self.tokenizer: Optional[AutoTokenizer] = None
         self.train_dataset: Optional[Dataset] = None
         self.val_dataset: Optional[Dataset] = None
         self.test_dataset: Optional[Dataset] = None
 
     def prepare_data(self) -> None:
         """
-        Download tokenizer or any external resources if needed.
-        This is called only from a single process.
+        Called only from a single process.
+        No-op here because tokenizer is provided from outside.
         """
-        AutoTokenizer.from_pretrained(self.tokenizer_name)
+        pass
 
     def setup(self, stage: Optional[str] = None) -> None:
         """
         Create datasets for each stage: 'fit', 'validate', 'test', 'predict'.
         """
-        if self.tokenizer is None:
-            self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name)
+        assert self.tokenizer is not None, "Tokenizer must be provided to LLaVADataModule."
 
         if stage == "fit" or stage is None:
             self.train_dataset = DummyI2TDataset(

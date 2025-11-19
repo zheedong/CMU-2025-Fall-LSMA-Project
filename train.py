@@ -5,7 +5,7 @@ Simple LLaVA-style Image-to-Text Trainer using Lightning.
 - Uses an injected vision encoder to extract visual features
 - Applies a learnable pooling layer on vision tokens
 - Projects pooled vision features to LM hidden size and prepends them as a prefix token
-- Trains with standard causal LM loss (labels = shifted input_ids)
+- Supports freezing the LM or fine-tuning with LoRA
 """
 
 from typing import Any, Dict, Optional
@@ -20,9 +20,11 @@ from transformers import (
     get_linear_schedule_with_warmup,
 )
 from torch.optim import AdamW
+from peft import LoraConfig, get_peft_model
 
 from model.dummy_vision_encoder import DummyVisionEncoder
-from datamodule.dummy_datamodule import DummyDataModule
+from datamodule.dummy_datamodule import LLaVADataModule
+
 
 # =========================
 # Vision pooling & LLaVA module
@@ -53,32 +55,42 @@ class LLaVATrainModule(LightningModule):
 
     Expected config example:
     config = {
-        "lm_model_name": "gpt2",
+        "lm_model_name": "meta-llama/Meta-Llama-3-8B-Instruct",
         "lr": 1e-4,
         "weight_decay": 0.01,
         "warmup_steps": 1000,
         "vision_hidden_size": 1024,  # feature dim of vision_model output
         "freeze_vision": True,
         "freeze_lm": False,
+        "use_lora": True,
     }
 
     The vision_model is injected from outside and should output either:
     - [B, V_DIM]
     - [B, T, V_DIM]
     or a dict with "last_hidden_state" / "pooler_output" etc.
+
+    The text_model can be a plain AutoModelForCausalLM or a PEFT LoRA-wrapped model.
     """
 
-    def __init__(self, config: Dict[str, Any], vision_model: nn.Module, text_tokenizer: AutoTokenizer, text_model: AutoModelForCausalLM):
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        vision_model: nn.Module,
+        text_tokenizer: AutoTokenizer,
+        text_model: AutoModelForCausalLM,
+    ):
         super().__init__()
-        self.save_hyperparameters(ignore=["vision_model"])
+        self.save_hyperparameters(ignore=["vision_model", "text_tokenizer", "text_model"])
         self.config = config
 
+        # Text tokenizer & LM (possibly LoRA-wrapped)
         self.text_tokenizer = text_tokenizer
         self.text_model = text_model
 
         lm_hidden_size = self.text_model.config.hidden_size
 
-        # 2) Vision backbone + learnable pooling + projection
+        # Vision backbone + learnable pooling + projection
         self.vision_model = vision_model
         vision_hidden_size = config["vision_hidden_size"]
 
@@ -99,9 +111,9 @@ class LLaVATrainModule(LightningModule):
         for p in self.vision_proj.parameters():
             p.requires_grad = True
 
-        # Optionally freeze language model
-        if config.get("freeze_lm", False):
-            for p in self.lm_model.parameters():
+        # Optionally freeze language model (only when not using LoRA)
+        if config.get("freeze_lm", False) and not config.get("use_lora", False):
+            for p in self.text_model.parameters():
                 p.requires_grad = False
 
     def encode_image(self, pixel_values: torch.Tensor) -> torch.Tensor:
@@ -166,7 +178,7 @@ class LLaVATrainModule(LightningModule):
         vision_embeds = vision_embeds.unsqueeze(1)        # [B, 1, H]
 
         # 2) Token embeddings from LM
-        input_embeds = self.lm_model.get_input_embeddings()(input_ids)  # [B, T, H]
+        input_embeds = self.text_model.get_input_embeddings()(input_ids)  # [B, T, H]
 
         # 3) Concatenate vision prefix and text embeddings
         inputs_embeds = torch.cat([vision_embeds, input_embeds], dim=1)  # [B, 1+T, H]
@@ -189,7 +201,7 @@ class LLaVATrainModule(LightningModule):
             labels = torch.cat([prefix_labels, labels], dim=1)  # [B, 1+T]
 
         # 6) LM forward (LM internally computes causal LM loss)
-        outputs = self.lm_model(
+        outputs = self.text_model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             labels=labels,
@@ -254,7 +266,7 @@ class LLaVATrainModule(LightningModule):
         optimizer = AdamW(params, lr=lr, weight_decay=weight_decay)
 
         # If no warmup or trainer not yet available, return optimizer only
-        if warmup_steps <= 0:
+        if warmup_steps <= 0 or self.trainer is None:
             return optimizer
 
         # Linear warmup + linear decay scheduler
@@ -279,20 +291,46 @@ class LLaVATrainModule(LightningModule):
 # =========================
 
 if __name__ == "__main__":
-    # Example config
+    # Set matmul precision for A100 Tensor Cores
+    torch.set_float32_matmul_precision("high")
+
+    # Example config for LLaMA 3 + LoRA
     config = {
-        "lm_model_name": "gpt2",
+        # Replace with the exact LLaMA 3 checkpoint you have access to
+        "lm_model_name": "meta-llama/Meta-Llama-3-8B-Instruct",
         "lr": 1e-4,
         "weight_decay": 0.01,
         "warmup_steps": 100,
         "vision_hidden_size": 1024,
         "freeze_vision": False,
-        "freeze_lm": False,
+        "freeze_lm": False,   # Set True if you want to freeze LM entirely (when not using LoRA)
+        "use_lora": True,     # Set True to enable LoRA, False for plain LM
+        # LoRA hyperparameters
+        "lora_r": 8,
+        "lora_alpha": 16,
+        "lora_dropout": 0.05,
     }
 
-    # 1) Build DataModule (will internally create tokenizer and datasets)
-    datamodule = DummyDataModule(
-        tokenizer_name=config["lm_model_name"],
+    # 1) Build vision encoder
+    vision_encoder = DummyVisionEncoder(
+        vision_hidden_size=config["vision_hidden_size"]
+    )
+
+    # 2) Build text tokenizer
+    text_tokenizer = AutoTokenizer.from_pretrained(
+        config["lm_model_name"],
+        use_fast=True,
+    )
+    # Ensure pad_token exists
+    if text_tokenizer.pad_token is None:
+        if text_tokenizer.eos_token is not None:
+            text_tokenizer.pad_token = text_tokenizer.eos_token
+        else:
+            text_tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+
+    # 3) Build DataModule (internally creates tokenizer and datasets)
+    datamodule = LLaVADataModule(
+        tokenizer=text_tokenizer,
         train_length=1000,
         val_length=200,
         test_length=200,
@@ -301,21 +339,40 @@ if __name__ == "__main__":
         num_workers=4,
     )
 
-    # 2) Build vision encoder
-    vision_encoder = DummyVisionEncoder(
-        vision_hidden_size=config["vision_hidden_size"]
+    # 4) Build base text model (LLaMA 3)
+    text_model = AutoModelForCausalLM.from_pretrained(
+        config["lm_model_name"],
+        torch_dtype=torch.bfloat16,  # matches bf16-mixed
     )
 
-    # Build Text Tokenizer
-    text_tokenizer = AutoTokenizer.from_pretrained(config["lm_model_name"])
-    if text_tokenizer.pad_token is None:
-        # Many causal LMs have no pad_token, so we reuse eos_token
-        text_tokenizer.pad_token = text_tokenizer.eos_token
+    # Resize embeddings if we added new special tokens
+    text_model.resize_token_embeddings(len(text_tokenizer))
 
-    # Build Text Model
-    text_model = AutoModelForCausalLM.from_pretrained(config["lm_model_name"])
+    # 5) Optionally wrap with LoRA
+    if config.get("use_lora", False):
+        # Typical target modules for LLaMA-style models
+        lora_target_modules = [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ]
+        lora_config = LoraConfig(
+            r=config.get("lora_r", 8),
+            lora_alpha=config.get("lora_alpha", 16),
+            lora_dropout=config.get("lora_dropout", 0.05),
+            target_modules=lora_target_modules,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        text_model = get_peft_model(text_model, lora_config)
+        # LoRA sets only adapter params as trainable
+        text_model.print_trainable_parameters()
 
-    # 3) Build LLaVA-style module
+    # 6) Build LLaVA-style module
     model = LLaVATrainModule(
         config=config,
         vision_model=vision_encoder,
@@ -323,7 +380,7 @@ if __name__ == "__main__":
         text_model=text_model,
     )
 
-    # 4) Lightning trainer
+    # 7) Lightning trainer
     trainer = Trainer(
         max_epochs=3,
         devices=1,
@@ -332,5 +389,5 @@ if __name__ == "__main__":
         log_every_n_steps=10,
     )
 
-    # 5) Train with DataModule
+    # 8) Train with DataModule
     trainer.fit(model, datamodule=datamodule)
