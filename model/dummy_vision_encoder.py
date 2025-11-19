@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+from vggt.models.vggt import VGGT
+from vggt.utils.load_fn import load_and_preprocess_images
 
 # =========================
 # Dummy vision encoder & dataset for testing
