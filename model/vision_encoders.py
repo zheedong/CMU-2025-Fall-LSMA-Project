@@ -24,7 +24,6 @@ class VisionEncoderWrapper(torch.nn.Module):
         super().__init__()
         self.vision_encoder_name = vision_encoder_name
         self.vision_encoder = get_vision_encoder(vision_encoder_name, device, dtype)
-        
 
     def forward(self, x: torch.Tensor, return_features: bool = True):
         """

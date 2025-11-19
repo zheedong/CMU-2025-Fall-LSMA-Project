@@ -85,7 +85,7 @@ class LLaVATrainModule(LightningModule):
         self.vision_proj = nn.Linear(vision_hidden_size, lm_hidden_size)
 
         # Freeze only the vision backbone if requested
-        if config.get("freeze_vision", False):
+        if config.get("freeze_vision", True):
             for p in self.vision_model.parameters():
                 p.requires_grad = False
 
@@ -94,7 +94,7 @@ class LLaVATrainModule(LightningModule):
             p.requires_grad = True
 
         # Optionally freeze language model (only when not using LoRA)
-        if config.get("freeze_lm", False) and not config.get("use_lora", False):
+        if config.get("freeze_lm", True) and config.get("use_lora", False):
             for p in self.text_model.parameters():
                 p.requires_grad = False
 
@@ -340,10 +340,6 @@ if __name__ == "__main__":
     vision_encoder = VisionEncoderWrapper(
         vision_encoder_name="vggt",
     )
-
-    # Freeze vision encoder
-    for param in vision_encoder.parameters():
-        param.requires_grad = False
 
     # 2) Build text tokenizer
     text_tokenizer = AutoTokenizer.from_pretrained(
