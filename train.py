@@ -26,7 +26,8 @@ from einops import rearrange
 
 # from model.dummy_vision_encoder import DummyVisionEncoder
 from model.vision_encoders import VisionEncoderWrapper
-from datamodule.dummy_datamodule import LLaVADataModule
+# from datamodule.dummy_datamodule import LLaVADataModule
+from datamodule.cc15m_datamodule import CCWebDatasetDataModule
 
 
 class LLaVATrainModule(LightningModule):
@@ -273,7 +274,7 @@ class LLaVATrainModule(LightningModule):
         scheduler = get_linear_schedule_with_warmup(
             optimizer,
             num_warmup_steps=warmup_steps,
-            num_training_steps=self.trainer.estimated_stepping_batches,
+            num_training_steps=self.config["num_training_step"],
         )
 
         return {
@@ -306,11 +307,22 @@ if __name__ == "__main__":
         "freeze_lm": False,   # Set True if you want to freeze LM entirely (when not using LoRA)
         "use_lora": True,     # Set True to enable LoRA, False for plain LM
         "vision_layer": -1,   # Which layer index to use from the vision encoder outputs
+        "num_workers": 8,
+        "shuffle_buffer": 10000,
+        "resampled": False,
+        "max_length": 32,
+        "training_epochs": 1,
+        "batch_size": 16,
+        "devices": 2,
         # LoRA hyperparameters
         "lora_r": 8,
         "lora_alpha": 16,
         "lora_dropout": 0.05,
     }
+    # Set number of training steps
+    # Use CC3M only
+    num_training_step = 3310000 * config["training_epochs"] // (config["batch_size"] * config['devices'])
+    config["num_training_step"] = num_training_step
 
     # 1) Build vision encoder
     # vision_encoder = DummyVisionEncoder(
@@ -319,6 +331,10 @@ if __name__ == "__main__":
     vision_encoder = VisionEncoderWrapper(
         vision_encoder_name="vggt",
     )
+
+    # Freeze vision encoder
+    for param in vision_encoder.parameters():
+        param.requires_grad = False
 
     # 2) Build text tokenizer
     text_tokenizer = AutoTokenizer.from_pretrained(
@@ -333,20 +349,34 @@ if __name__ == "__main__":
             text_tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
     # 3) Build DataModule
-    datamodule = LLaVADataModule(
+    # Dummy DataModule Example
+    # datamodule = LLaVADataModule(
+    #     tokenizer=text_tokenizer,
+    #     train_length=1000,
+    #     val_length=200,
+    #     test_length=200,
+    #     max_length=32,
+    #     batch_size=4,
+    #     num_workers=4,
+    # )
+    
+    datamodule = CCWebDatasetDataModule(
         tokenizer=text_tokenizer,
-        train_length=1000,
-        val_length=200,
-        test_length=200,
-        max_length=32,
-        batch_size=4,
-        num_workers=4,
+        train_shards="data/cc3m/{00002..00331}.tar",
+        val_shards="data/cc3m/{00000..00001}.tar",
+        # image_transform=image_transform,
+        max_length=config["max_length"],
+        batch_size=config["batch_size"],
+        num_workers=config["num_workers"],
+        shuffle_buffer=config["shuffle_buffer"],
+        resampled=config["resampled"],
+        num_training_step=config["num_training_step"],
     )
 
     # 4) Build base text model (LLaMA 3)
     text_model = AutoModelForCausalLM.from_pretrained(
         config["lm_model_name"],
-        torch_dtype=torch.bfloat16,  # matches bf16-mixed
+        dtype=torch.bfloat16,  # matches bf16-mixed
     )
 
     # Resize embeddings if we added new special tokens
@@ -385,11 +415,11 @@ if __name__ == "__main__":
 
     # 7) Lightning trainer
     trainer = Trainer(
-        max_epochs=3,
-        devices=1,
+        max_epochs=config["training_epochs"],
+        devices=config["devices"],
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         precision="bf16-mixed" if torch.cuda.is_available() else "32-true",
-        log_every_n_steps=10,
+        log_every_n_steps=1,
     )
 
     # 8) Train with DataModule

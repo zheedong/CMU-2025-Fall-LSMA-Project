@@ -1,5 +1,5 @@
 import os
-from typing import Optional, Dict, Any, Callable, List
+from typing import Optional, Dict, Any, Callable, List, Union, Sequence
 
 import torch
 from torch.utils.data import DataLoader
@@ -9,52 +9,40 @@ import webdataset as wds
 from transformers import AutoTokenizer
 
 
-class CC15MWebDatasetDataModule(LightningDataModule):
+class CCWebDatasetDataModule(LightningDataModule):
     """
-    LightningDataModule for CC15M using WebDataset (img2dataset tars).
+    LightningDataModule for CC-style datasets (e.g., CC3M + CC12M) using WebDataset.
 
-    Expected shard structure (typical img2dataset CC15M):
-        - Each .tar contains samples with keys like:
-            - __key__.txt
-            - some_hash.jpg
-            - some_hash.txt   # caption
+    It can take multiple shard patterns or lists, e.g.:
 
-    We use WebDataset pipeline:
-        - wds.WebDataset(shards).decode("pil").to_tuple("jpg", "txt")
-        - map(...) to apply image transform and tokenize caption
+        train_shards = [
+            "/data/cc3m/train-{00000..00999}.tar",
+            "/data/cc12m/train-{00000..01999}.tar",
+        ]
 
-    Example usage:
-        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-
-        dm = CC15MWebDatasetDataModule(
-            tokenizer=tokenizer,
-            train_shards="/data/cc15m/train/cc15m-train-{00000..09999}.tar",
-            val_shards="/data/cc15m/val/cc15m-val-{00000..00009}.tar",
-            batch_size=4,
-        )
+    WebDataset will expand and stream all of them as one dataset.
     """
 
     def __init__(
         self,
         tokenizer: AutoTokenizer,
-        train_shards: str,
-        val_shards: Optional[str] = None,
-        test_shards: Optional[str] = None,
+        train_shards: Union[str, Sequence[str]],
+        val_shards: Optional[Union[str, Sequence[str]]] = None,
+        test_shards: Optional[Union[str, Sequence[str]]] = None,
         image_transform: Optional[Callable] = None,
         max_length: int = 32,
         batch_size: int = 4,
         num_workers: int = 4,
         shuffle_buffer: int = 10_000,
         resampled: bool = False,
+        num_training_step: int = 1000000,
     ):
         """
         Args:
-            tokenizer: HuggingFace tokenizer (pad_token must be set).
-            train_shards: Pattern or list of shard URLs for training, e.g. "/path/train-{00000..09999}.tar".
-            val_shards: Pattern or list for validation shards.
-            test_shards: Pattern or list for test shards.
+            tokenizer: HuggingFace tokenizer (pad_token must be set or will be set here).
+            train_shards: String pattern or list/tuple of patterns/urls for training shards.
+            val_shards: String pattern or list/tuple for validation shards.
+            test_shards: String pattern or list/tuple for test shards.
             image_transform: Callable that takes a PIL image and returns a tensor [C,H,W].
             max_length: Max token length for caption text.
             batch_size: Batch size for all splits.
@@ -73,8 +61,8 @@ class CC15MWebDatasetDataModule(LightningDataModule):
         self.num_workers = num_workers
         self.shuffle_buffer = shuffle_buffer
         self.resampled = resampled
+        self.num_training_step = num_training_step
 
-        # Internal caches for datasets (webdataset pipelines)
         self.train_dataset = None
         self.val_dataset = None
         self.test_dataset = None
@@ -86,6 +74,21 @@ class CC15MWebDatasetDataModule(LightningDataModule):
             else:
                 self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
+    # --------- Small helper --------- #
+
+    @staticmethod
+    def _normalize_shards(shards: Union[str, Sequence[str]]) -> Union[str, List[str]]:
+        """
+        Normalize shard specification to either a string pattern or a list of strings.
+
+        WebDataset supports:
+            - a single brace pattern string, e.g. "train-{00000..09999}.tar"
+            - a list of explicit shard URLs / patterns
+        """
+        if isinstance(shards, (list, tuple)):
+            return list(shards)
+        return shards
+
     def prepare_data(self) -> None:
         """
         Called only on one process. No heavy work needed here, since shards already exist on disk.
@@ -96,7 +99,7 @@ class CC15MWebDatasetDataModule(LightningDataModule):
 
     def _build_webdataset(
         self,
-        shards: str,
+        shards: Union[str, Sequence[str]],
         is_train: bool = True,
     ) -> wds.WebDataset:
         """
@@ -106,14 +109,16 @@ class CC15MWebDatasetDataModule(LightningDataModule):
             - "jpg": image file
             - "txt": caption text file
         """
+        shards_norm = self._normalize_shards(shards)
+
         if self.resampled:
             dataset = wds.WebDataset(
-                wds.ResampledShards(shards),
+                wds.ResampledShards(shards_norm),
                 shardshuffle=is_train,
             )
         else:
             dataset = wds.WebDataset(
-                shards,
+                shards_norm,
                 shardshuffle=is_train,
             )
 
@@ -145,7 +150,6 @@ class CC15MWebDatasetDataModule(LightningDataModule):
         if self.image_transform is not None:
             pixel_values = self.image_transform(image)  # [C, H, W]
         else:
-            # Default: convert to tensor in [0, 1]
             import torchvision.transforms as T
 
             default_transform = T.Compose(
@@ -166,9 +170,7 @@ class CC15MWebDatasetDataModule(LightningDataModule):
         )
         input_ids = enc.input_ids[0]            # [T]
         attention_mask = enc.attention_mask[0]  # [T]
-
-        # For causal LM training, labels are usually the same as input_ids
-        labels = input_ids.clone()
+        labels = input_ids.clone()              # typical causal LM training
 
         return {
             "pixel_values": pixel_values,
@@ -211,8 +213,8 @@ class CC15MWebDatasetDataModule(LightningDataModule):
             batch_size=self.batch_size,
             num_workers=self.num_workers,
         )
-        # Optionally, set length if you want nice progress bars:
-        # loader = loader.with_length(estimated_num_batches)
+        loader = loader.with_length(self.num_training_step)
+
         return loader
 
     def val_dataloader(self) -> DataLoader:
