@@ -3,8 +3,8 @@ Simple LLaVA-style Image-to-Text Trainer using Lightning.
 
 - Loads an arbitrary causal LM from Hugging Face (AutoModelForCausalLM)
 - Uses an injected vision encoder to extract visual features
-- Applies a learnable pooling layer on vision tokens
-- Projects pooled vision features to LM hidden size and prepends them as a prefix token
+- Treats vision patches as a token sequence (no pooling)
+- Projects vision token features to LM hidden size and prepends them as a prefix token sequence
 - Supports freezing the LM or fine-tuning with LoRA
 """
 
@@ -29,29 +29,6 @@ from model.vision_encoders import VisionEncoderWrapper
 from datamodule.dummy_datamodule import LLaVADataModule
 
 
-# =========================
-# Vision pooling & LLaVA module
-# =========================
-
-class VisionPoolingHead(nn.Module):
-    """
-    Learnable attention pooling over vision tokens.
-    Input:  x [B, T, H]
-    Output: pooled [B, H]
-    """
-
-    def __init__(self, hidden_size: int):
-        super().__init__()
-        self.attn = nn.Linear(hidden_size, 1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, T, H]
-        scores = self.attn(x)  # [B, T, 1]
-        attn_weights = torch.softmax(scores, dim=1)  # softmax over T
-        pooled = (attn_weights * x).sum(dim=1)  # [B, H]
-        return pooled
-
-
 class LLaVATrainModule(LightningModule):
     """
     Simple LLaVA-style LightningModule.
@@ -62,18 +39,22 @@ class LLaVATrainModule(LightningModule):
         "lr": 1e-4,
         "weight_decay": 0.01,
         "warmup_steps": 1000,
-        "vision_hidden_size": 1024,  # feature dim of vision_model output
+        "vision_hidden_size": 2048,  # feature dim of vision_model output
         "freeze_vision": True,
         "freeze_lm": False,
         "use_lora": True,
+        "vision_layer": -1,         # which layer index to use from vision_model outputs (if applicable)
     }
 
     The vision_model is injected from outside and should output either:
-    - [B, V_DIM]
-    - [B, T, V_DIM]
-    or a dict with "last_hidden_state" / "pooler_output" etc.
+    - [B, T_v, V_DIM]
+    - [B, C, H, W] (which will be reshaped to [B, T_v, V_DIM])
+    - or a dict/object that contains "last_hidden_state" etc.
 
     The text_model can be a plain AutoModelForCausalLM or a PEFT LoRA-wrapped model.
+
+    Vision tokens are projected and used as a prefix token sequence for the LM
+    (no pooling to a single vector).
     """
 
     def __init__(
@@ -93,14 +74,11 @@ class LLaVATrainModule(LightningModule):
 
         lm_hidden_size = self.text_model.config.hidden_size
 
-        # Vision backbone + learnable pooling + projection
+        # Vision backbone + projection
         self.vision_model = vision_model
         vision_hidden_size = config["vision_hidden_size"]
 
-        # Learnable pooling head on top of vision tokens
-        self.vision_pool = VisionPoolingHead(vision_hidden_size)
-
-        # Projection from vision_hidden_size to LM hidden size
+        # Linear projection for each vision token: V_DIM -> LM_HIDDEN
         self.vision_proj = nn.Linear(vision_hidden_size, lm_hidden_size)
 
         # Freeze only the vision backbone if requested
@@ -108,9 +86,7 @@ class LLaVATrainModule(LightningModule):
             for p in self.vision_model.parameters():
                 p.requires_grad = False
 
-        # Pooling & projection are always trainable
-        for p in self.vision_pool.parameters():
-            p.requires_grad = True
+        # Projection is always trainable
         for p in self.vision_proj.parameters():
             p.requires_grad = True
 
@@ -121,31 +97,45 @@ class LLaVATrainModule(LightningModule):
 
     def encode_image(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """
-        Encode images into a single pooled feature vector per image.
+        Encode images into a sequence of vision token features.
 
         This method:
         - Runs the vision backbone (optionally frozen)
-        - Handles several common output formats (dict, tuple, plain tensor)
-        - Applies a learnable attention pooling over token features
+        - Selects a layer if the vision model returns a list of features
+        - Converts 4D features to [B, T_v, V_DIM] if necessary
+        - Returns a tensor of shape [B, T_v, V_DIM]
         """
         # Run vision backbone with or without gradient based on freeze_vision
         with torch.set_grad_enabled(not self.config.get("freeze_vision", False)):
             if self.config.get("freeze_vision", False):
                 self.vision_model.eval()
             vision_out = self.vision_model(pixel_values)
-        
-        # Use selected layer if provided
-        vision_out = vision_out[self.config.get("vision_layer", -1)]
-        if vision_out.dim() == 4:
-            vision_out = rearrange(vision_out, 'b 1 patch dim -> b patch dim')      # Remove seq dim
 
-        # Extract sequence features [B, T, V_DIM] from various output formats
+        # If the vision model returns a list or tuple of layers, select one
+        vision_layer_idx = self.config.get("vision_layer", -1)
+        if isinstance(vision_out, (list, tuple)):
+            vision_out = vision_out[vision_layer_idx]
+
+        # If 4D, try to reshape to [B, T_v, V_DIM]
+        # Adjust this logic to match your VisionEncoderWrapper output format.
+        if isinstance(vision_out, torch.Tensor) and vision_out.dim() == 4:
+            # Example expected shape from VisionEncoderWrapper: [B, 1, num_patches, dim]
+            # Rearrange to [B, num_patches, dim]
+            # If your actual shape is [B, C, H, W], you should instead use:
+            #   vision_out = rearrange(vision_out, "b c h w -> b (h w) c")
+            try:
+                vision_out = rearrange(vision_out, "b 1 patch dim -> b patch dim")
+            except Exception:
+                # Fallback: assume [B, C, H, W]
+                vision_out = rearrange(vision_out, "b c h w -> b (h w) c")
+
+        # Now handle dict / object-style outputs
         if isinstance(vision_out, dict):
             if "last_hidden_state" in vision_out:
-                seq_feats = vision_out["last_hidden_state"]  # [B, T, V_DIM]
+                seq_feats = vision_out["last_hidden_state"]  # [B, T_v, V_DIM]
             elif "pooler_output" in vision_out:
-                pooled = vision_out["pooler_output"]  # [B, V_DIM]
-                seq_feats = pooled.unsqueeze(1)  # [B, 1, V_DIM]
+                pooled = vision_out["pooler_output"]         # [B, V_DIM]
+                seq_feats = pooled.unsqueeze(1)              # [B, 1, V_DIM]
             else:
                 # Fallback: take the first value
                 seq_feats = next(iter(vision_out.values()))
@@ -154,19 +144,19 @@ class LLaVATrainModule(LightningModule):
         else:
             # Non-dict output: assume tensor or object with last_hidden_state
             if hasattr(vision_out, "last_hidden_state"):
-                seq_feats = vision_out.last_hidden_state  # [B, T, V_DIM]
+                seq_feats = vision_out.last_hidden_state      # [B, T_v, V_DIM]
             else:
                 feats = vision_out
                 if feats.dim() == 2:
                     # [B, V_DIM] -> [B, 1, V_DIM]
                     seq_feats = feats.unsqueeze(1)
                 else:
-                    # Assume already [B, T, V_DIM]
+                    # Assume already [B, T_v, V_DIM]
                     seq_feats = feats
 
-        # seq_feats: [B, T, V_DIM]
-        pooled_feats = self.vision_pool(seq_feats)  # [B, V_DIM]
-        return pooled_feats
+        # seq_feats: [B, T_v, V_DIM]
+        assert seq_feats.dim() == 3, f"Expected [B, T_v, V_DIM], got {seq_feats.shape}"
+        return seq_feats
 
     def forward(
         self,
@@ -177,38 +167,38 @@ class LLaVATrainModule(LightningModule):
     ):
         """
         Forward pass:
-        - Encode images into a pooled vision feature
-        - Project to LM hidden size
-        - Prepend vision embedding as one prefix token
+        - Encode images into a sequence of vision token features [B, T_v, V_DIM]
+        - Project to LM hidden size: [B, T_v, H]
+        - Prepend vision embeddings as a prefix token sequence
         - Call LM with inputs_embeds, attention_mask, and labels
         """
-        # 1) Encode image and project to LM hidden size
-        vision_feats = self.encode_image(pixel_values)    # [B, V_DIM]
-        vision_embeds = self.vision_proj(vision_feats)    # [B, H]
-        vision_embeds = vision_embeds.unsqueeze(1)        # [B, 1, H]
+        # 1) Encode image to vision token sequence and project to LM hidden size
+        vision_tokens = self.encode_image(pixel_values)       # [B, T_v, V_DIM]
+        vision_embeds = self.vision_proj(vision_tokens)       # [B, T_v, H]
 
         # 2) Token embeddings from LM
         input_embeds = self.text_model.get_input_embeddings()(input_ids)  # [B, T, H]
 
         # 3) Concatenate vision prefix and text embeddings
-        inputs_embeds = torch.cat([vision_embeds, input_embeds], dim=1)  # [B, 1+T, H]
+        inputs_embeds = torch.cat([vision_embeds, input_embeds], dim=1)   # [B, T_v+T, H]
 
-        # 4) Extend attention mask for the prefix token
+        # 4) Extend attention mask for the vision tokens
         bsz = attention_mask.size(0)
-        prefix_mask = torch.ones(
-            bsz, 1, dtype=attention_mask.dtype, device=attention_mask.device
+        num_vision_tokens = vision_embeds.size(1)
+        vision_mask = torch.ones(
+            bsz, num_vision_tokens, dtype=attention_mask.dtype, device=attention_mask.device
         )
-        attention_mask = torch.cat([prefix_mask, attention_mask], dim=1)  # [B, 1+T]
+        attention_mask = torch.cat([vision_mask, attention_mask], dim=1)  # [B, T_v+T]
 
-        # 5) Extend labels; ignore prefix position in the loss
+        # 5) Extend labels; ignore vision positions in the loss
         if labels is not None:
-            prefix_labels = torch.full(
-                (bsz, 1),
+            vision_labels = torch.full(
+                (bsz, num_vision_tokens),
                 -100,
                 dtype=labels.dtype,
                 device=labels.device,
             )
-            labels = torch.cat([prefix_labels, labels], dim=1)  # [B, 1+T]
+            labels = torch.cat([vision_labels, labels], dim=1)            # [B, T_v+T]
 
         # 6) LM forward (LM internally computes causal LM loss)
         outputs = self.text_model(
@@ -311,10 +301,11 @@ if __name__ == "__main__":
         "lr": 1e-4,
         "weight_decay": 0.01,
         "warmup_steps": 100,
-        "vision_hidden_size": 1024,
+        "vision_hidden_size": 2048,
         "freeze_vision": False,
         "freeze_lm": False,   # Set True if you want to freeze LM entirely (when not using LoRA)
         "use_lora": True,     # Set True to enable LoRA, False for plain LM
+        "vision_layer": -1,   # Which layer index to use from the vision encoder outputs
         # LoRA hyperparameters
         "lora_r": 8,
         "lora_alpha": 16,
@@ -341,7 +332,7 @@ if __name__ == "__main__":
         else:
             text_tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
-    # 3) Build DataModule (internally creates tokenizer and datasets)
+    # 3) Build DataModule
     datamodule = LLaVADataModule(
         tokenizer=text_tokenizer,
         train_length=1000,
@@ -382,7 +373,6 @@ if __name__ == "__main__":
             task_type="CAUSAL_LM",
         )
         text_model = get_peft_model(text_model, lora_config)
-        # LoRA sets only adapter params as trainable
         text_model.print_trainable_parameters()
 
     # 6) Build LLaVA-style module
