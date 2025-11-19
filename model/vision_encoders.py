@@ -1,9 +1,11 @@
 import torch
+from einops import rearrange
 
 def get_vision_encoder(name="vggt", device=None, dtype=None):
     
     if name == "vggt":
-        from vggt.models.vggt import VGGT
+        # from vggt.models.vggt import VGGT
+        from model.vggt.models.vggt import VGGT
         
         device = "cuda" if torch.cuda.is_available() else "cpu" if device is None else device
         # bfloat16 is supported on Ampere GPUs (Compute Capability 8.0+) 
@@ -17,8 +19,6 @@ def get_vision_encoder(name="vggt", device=None, dtype=None):
 
     return model
 
-
-
 class VisionEncoderWrapper(torch.nn.Module):
     def __init__(self, vision_encoder_name="vggt", device=None, dtype=None):
         super().__init__()
@@ -26,7 +26,7 @@ class VisionEncoderWrapper(torch.nn.Module):
         self.vision_encoder = get_vision_encoder(vision_encoder_name, device, dtype)
         
 
-    def forward(self, x: torch.Tensor, return_features: bool = False):
+    def forward(self, x: torch.Tensor, return_features: bool = True):
         """
         for vggt, the input shape is [B, S, 3, H, W]
         Args:
@@ -36,6 +36,8 @@ class VisionEncoderWrapper(torch.nn.Module):
             torch.Tensor or list of torch.Tensor: Output tensor or list of feature maps.
         """
         if self.vision_encoder_name == "vggt":
+            if x.dim() == 4:
+                x = rearrange(x, "b c h w -> b 1 c h w")     # Make seq dim
             assert x.dim() == 5, "Input tensor must have shape [B, S, 3, H, W]"
             # in shape [B, S, 3, H, W]
             # out shape [B, S, patch_num, 2048]
